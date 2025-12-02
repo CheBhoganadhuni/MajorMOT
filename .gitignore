@@ -1,0 +1,44 @@
+# ---- Python bytecode / cache ----
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# ---- Environments ----
+venv/
+.venv/
+env/
+ENV/
+
+# ---- Jupyter ----
+.ipynb_checkpoints/
+
+# ---- Build / packaging ----
+build/
+dist/
+*.egg-info/
+
+# ---- IDE / Editor ----
+.vscode/
+.idea/
+*.code-workspace
+
+# ---- OS files ----
+.DS_Store
+Thumbs.db
+
+# ---- Logs ----
+*.log
+
+*.mp4
+*.mkv
+
+# ---- Videos / generated tracking outputs ----
+runs/
+*.mp4
+*.avi
+*.mkv
+
+# ---- YOLO / StrongSORT intermediate stuff ----
+*.cache
+*.temp
