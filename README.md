@@ -1,6 +1,21 @@
 # 👣 People Attendance System – YOLOv9 + StrongSORT + OSNet
 
-This repository contains my B.Tech major work on **multi-object person tracking** using **YOLOv9** for detection and **StrongSORT + OSNet** for re-identification.
+## 👥 Team
+
+- B. Chetan (N200518)
+- K. Harshitha (N200373)  
+- Ch. Rajeswari (N200427)    
+- Sk. Akhil (N200145)  
+
+> Chetan, Akhil Worked On _strongsort_, Harshitha, Rajeswari worked on _yolov9_ aspects
+
+**Mentor:** Y. Kalavathi, Dept. of CSE, RGUKT Nuzvid
+
+---
+
+
+
+This repository contains Our B.Tech major work on **multi-object person tracking** using **YOLOv9** for detection and **StrongSORT + OSNet** for re-identification.
 
 The core idea is:
 
