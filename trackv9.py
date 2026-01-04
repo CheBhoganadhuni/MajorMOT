@@ -15,6 +15,7 @@ import torch
 import torch.backends.cudnn as cudnn
 from numpy import random
 from time import time
+import pickle
 
 
 FILE = Path(__file__).resolve()
@@ -87,6 +88,7 @@ def run(
         half=False,  # use FP16 half-precision inference
         dnn=False,  # use OpenCV DNN for ONNX inference
         vid_stride=1,  # video frame-rate stride
+        gallery='gallery.pkl',  # path to gallery
 ):
 
     source = str(source)
@@ -159,6 +161,19 @@ def run(
     outputs = [None] * bs
     
     colors = [[random.randint(0, 255) for _ in range(3)] for _ in names]
+
+    # Load gallery once
+    gallery_dict = {}
+    gallery_path = gallery
+    if not os.path.exists(gallery_path):
+        gallery_path = ROOT / gallery
+    
+    if os.path.exists(gallery_path):
+         with open(gallery_path, "rb") as f:
+            gallery_dict = pickle.load(f)
+            print(f"Loaded gallery from {gallery_path} with {len(gallery_dict)} identities: {list(gallery_dict.keys())}")
+    else:
+        print(f"Gallery not found at {gallery_path}, running without identification.")
 
     # Run tracking
     model.warmup(imgsz=(1 if pt or model.triton else bs, 3, *imgsz))  # warmup
@@ -249,6 +264,50 @@ def run(
                 t5 = time_sync()
                 sdt[3] += t5 - t4
 
+                # ID Assignment loop
+                id_map = {}
+                
+                # Use pre-loaded gallery_dict
+                if gallery_dict:
+                     # Iterate over tracks and match against gallery
+                     for t in strongsort_list[i].tracker.tracks:
+                         if not t.is_confirmed() or t.time_since_update > 1:
+                             continue
+                         
+                         # Get latest feature (or average)
+                         if len(t.features) > 0:
+                             feat = t.features[-1]
+                             feat = feat / np.linalg.norm(feat) # Ensure normalized
+                             
+                             min_dist = 100 # Reset min_dist
+                             
+                             # DEBUG: Print that we are checking a track
+                             # print(f"Checking Track {t.track_id}...", end=" ")
+
+                             for name, g_feat in gallery_dict.items():
+                                 # Cosine distance: 1 - dot(a, b) (assuming normalized)
+                                 dist = 1.0 - np.dot(feat, g_feat)
+                                 
+                                 # Ensure scalar for printing/comparison
+                                 if isinstance(dist, np.ndarray):
+                                     dist = dist.item()
+                                 
+                                 # DEBUG: Print distance
+                                 print(f"  vs {name}: {dist:.4f}")
+
+                                 if dist < min_dist:
+                                     min_dist = dist
+                                     best_name = name
+                             
+                             # Threshold check (lowered to 0.1 based on test results)
+                             if best_name and min_dist < 0.1:
+                                 id_map[t.track_id] = best_name
+                                 print(f"[MATCH] Track ID {t.track_id} identified as {best_name} (Dist: {min_dist:.4f})")
+                             else:
+                                 # Optional: Print why it failed
+                                 if best_name:
+                                     print(f"[NO MATCH] Track ID {t.track_id} closest to {best_name} but dist {min_dist:.4f} > 0.1")
+
                 # Write results
                 for j, (output, conf) in enumerate(zip(outputs[i], confs)):
                     xyxy = output[0:4]
@@ -264,13 +323,17 @@ def run(
 
                     if save_img or save_crop or view_img:  # Add bbox to image
                         c = int(cls)  # integer class
-                        label = None if hide_labels else (names[c] if hide_conf else f' { id } {names[c]} {conf:.2f}')
+                        # Custom Identification
+                        identity = id_map.get(int(id), str(int(id)))
+                        label = None if hide_labels else (names[c] if hide_conf else f' { identity } {names[c]} {conf:.2f}')
                         plot_one_box(xyxy, im0, label=label, color=colors[int(cls)], line_thickness=2)
                     if save_crop:
                         save_one_box(xyxy, imc, file=save_dir / 'crops' / names[c] / f'{p.stem}.jpg', BGR=True)
 
 
-                # # draw boxes for visualization
+
+
+                # Draw boxes
                 # if len(outputs[i]) > 0:
                 #     for j, (output, conf) in enumerate(zip(outputs[i], confs)):
     
@@ -291,7 +354,11 @@ def run(
                 #         if save_img or save_crop or view_img:  # Add bbox to image
                 #             c = int(cls)  # integer class
                 #             id = int(id)  # integer id
-                #             label = None if hide_labels else (names[c] if hide_conf else f'{names[c]} {conf:.2f}')
+                #             
+                #             # CUSTOM: Use name if identified
+                #             identity = id_map.get(id, str(id))
+                #             
+                #             label = None if hide_labels else (names[c] if hide_conf else f'{names[c]} {identity} {conf:.2f}')
                 #             plot_one_box(bboxes, im0, label=label, color=colors[int(cls)], line_thickness=2)
                 #             if save_crop:
                 #                 txt_file_name = txt_file_name if (isinstance(path, list) and len(path) > 1) else ''
@@ -376,6 +443,7 @@ def parse_opt():
     parser.add_argument('--half', action='store_true', help='use FP16 half-precision inference')
     parser.add_argument('--vid-stride', type=int, default=1, help='video frame-rate stride')
     parser.add_argument('--dnn', action='store_true', help='use OpenCV DNN for ONNX inference')
+    parser.add_argument('--gallery', type=str, default='gallery.pkl', help='path to gallery.pkl for person identification')
     opt = parser.parse_args()
     opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
 
