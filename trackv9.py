@@ -284,22 +284,34 @@ def run(
                              # DEBUG: Print that we are checking a track
                              # print(f"Checking Track {t.track_id}...", end=" ")
 
-                             for name, g_feat in gallery_dict.items():
-                                 # Cosine distance: 1 - dot(a, b) (assuming normalized)
-                                 dist = 1.0 - np.dot(feat, g_feat)
+                             # Loop through specific people in gallery
+                             for name, g_feats in gallery_dict.items():
+                                 # Handle multi-look (list of features) vs single formatted gallery
+                                 if not isinstance(g_feats, list):
+                                     g_feats = [g_feats] # Backward compatibility
+                                     
+                                 # Find the closest "look" for this person
+                                 person_min_dist = 100.0
                                  
-                                 # Ensure scalar for printing/comparison
-                                 if isinstance(dist, np.ndarray):
-                                     dist = dist.item()
+                                 for g_feat in g_feats:
+                                     current_dist = 1.0 - np.dot(feat, g_feat)
+                                     
+                                     # Ensure scalar
+                                     if isinstance(current_dist, np.ndarray):
+                                         current_dist = current_dist.item()
+                                         
+                                     if current_dist < person_min_dist:
+                                         person_min_dist = current_dist
                                  
-                                 # DEBUG: Print distance
-                                 print(f"  vs {name}: {dist:.4f}")
-
-                                 if dist < min_dist:
-                                     min_dist = dist
+                                 # Check if this person is the overall best match
+                                 if person_min_dist < min_dist:
+                                     min_dist = person_min_dist
                                      best_name = name
-                             
-                             # Threshold check (lowered to 0.1 based on test results)
+                                     
+                                 # DEBUG: Print distance (closest look)
+                                 # print(f"  vs {name}: {person_min_dist:.4f}")
+
+                             # Threshold check (kept at 0.1)
                              if best_name and min_dist < 0.1:
                                  id_map[t.track_id] = best_name
                                  print(f"[MATCH] Track ID {t.track_id} identified as {best_name} (Dist: {min_dist:.4f})")

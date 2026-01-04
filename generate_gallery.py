@@ -76,16 +76,18 @@ def generate_gallery(dataset_path, weights_path, device='cpu', output_file='gall
             features_list.append(feat)
             
         if features_list:
-            # Average features for this person to get a robust representation
-            # features_list is list of (Dim,) arrays
-            # np.stack -> (N, Dim)
-            features_arr = np.stack(features_list, axis=0)
-            mean_feat = np.mean(features_arr, axis=0)
-            # Normalize
-            mean_feat = mean_feat / np.linalg.norm(mean_feat)
+            # Save ALL feature vectors instead of averaging
+            # This allows "Multi-Look" matching (different angles, clothes)
+            # features_list is a list of (Dim,) numpy arrays
             
-            gallery[person_name] = mean_feat
-            print(f"  Saved {len(features_list)} images for {person_name}")
+            # Normalize each feature independently
+            normalized_features = []
+            for feat in features_list:
+                norm_feat = feat / np.linalg.norm(feat)
+                normalized_features.append(norm_feat)
+            
+            gallery[person_name] = normalized_features
+            print(f"  Saved {len(normalized_features)} unique looks for {person_name}")
         else:
             print(f"  No valid images found for {person_name}")
 
