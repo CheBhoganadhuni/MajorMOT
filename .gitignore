@@ -30,14 +30,14 @@ Thumbs.db
 # ---- Logs ----
 *.log
 
-*.mp4
-*.mkv
+# *.mp4
+# *.mkv
 
 # ---- Videos / generated tracking outputs ----
-runs/
-*.mp4
-*.avi
-*.mkv
+# runs/
+# *.mp4
+# *.avi
+# *.mkv
 
 # ---- YOLO / StrongSORT intermediate stuff ----
 *.cache
