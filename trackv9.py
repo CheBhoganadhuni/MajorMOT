@@ -89,8 +89,8 @@ def run(
         dnn=False,  # use OpenCV DNN for ONNX inference
         vid_stride=1,  # video frame-rate stride
         gallery='gallery.pkl',  # path to gallery
+        save_log=False, # Save ID logs
 ):
-
     source = str(source)
     save_img = not nosave and not source.endswith('.txt')  # save inference images
     is_file = Path(source).suffix[1:] in (VID_FORMATS)
@@ -113,6 +113,15 @@ def run(
     save_dir = increment_path(Path(project) / exp_name, exist_ok=exist_ok)  # increment run
     save_dir = Path(save_dir)
     (save_dir / 'tracks' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
+
+    # Initialize Log File
+    log_path = save_dir / 'attendance_log.csv'
+    if save_log:
+        with open(log_path, 'w') as f:
+            f.write('Frame,Timestamp,TrackID,Name,Confidence,Dist\n')
+        print(f"Logging attendance to {log_path}")
+    
+    log_count = 0
 
     # Load model
     device = select_device(device)
@@ -174,6 +183,35 @@ def run(
             print(f"Loaded gallery from {gallery_path} with {len(gallery_dict)} identities: {list(gallery_dict.keys())}")
     else:
         print(f"Gallery not found at {gallery_path}, running without identification.")
+
+    # OPTIMIZATION: Vectorize Gallery for fast matrix multiplication
+    gallery_matrix = []
+    gallery_labels = [] # Parallel list to store names corresponding to rows
+    if gallery_dict:
+        print("Vectorizing gallery for performance...")
+        for name, feats in gallery_dict.items():
+             if not isinstance(feats, list):
+                 feats = [feats]
+             for f in feats:
+                 # Ensure shape is correct (sometimes could be 1, 512)
+                 f = f.reshape(-1)
+                 gallery_matrix.append(f)
+                 gallery_labels.append(name)
+        
+        if gallery_matrix:
+            gallery_matrix = np.array(gallery_matrix) # Shape: (N_looks, 512)
+            print(f"Gallery Matrix Shape: {gallery_matrix.shape}")
+        else:
+            print("Warning: Gallery dictionary was empty or invalid.")
+    
+    # OPTIMIZATION: Cache for identified tracks to avoid re-computing every frame
+    # Format: {track_id: {'name': name, 'last_check': frame_idx}}
+    id_cache = {}
+    
+    # Store distances for logging (TrackID -> Dist)
+    dist_map = {}
+
+
 
     # Run tracking
     model.warmup(imgsz=(1 if pt or model.triton else bs, 3, *imgsz))  # warmup
@@ -268,57 +306,80 @@ def run(
                 id_map = {}
                 
                 # Use pre-loaded gallery_dict
-                if gallery_dict:
+                if gallery_dict and len(gallery_matrix) > 0:
                      # Iterate over tracks and match against gallery
                      for t in strongsort_list[i].tracker.tracks:
                          if not t.is_confirmed() or t.time_since_update > 1:
                              continue
                          
-                         # Get latest feature (or average)
-                         if len(t.features) > 0:
+                         # OPTIMIZATION: Persistent Caching Logic
+                         # Check if we already know this track ID from previous frames
+                         cached_name = id_cache.get(t.track_id)
+                         
+                         should_run_matching = True
+                         if cached_name:
+                             # We know this person. 
+                             # Optimization: Only re-verify every 30 frames to save compute.
+                             if frame_idx % 30 != 0:
+                                 should_run_matching = False
+                                 # Trust the cache for this frame
+                                 id_map[t.track_id] = cached_name
+                         
+                         if should_run_matching and len(t.features) > 0:
                              feat = t.features[-1]
                              feat = feat / np.linalg.norm(feat) # Ensure normalized
+                             feat = feat.reshape(-1) # Ensure (512,)
                              
-                             min_dist = 100 # Reset min_dist
+                             # OPTIMIZATION: Vectorized Cosine Distance
+                             # Dist = 1 - (Gallery . Track)
+                             # Shape: (N,) = (N, 512) . (512,)
+                             scores = np.dot(gallery_matrix, feat)
+                             dists = 1.0 - scores
                              
-                             # DEBUG: Print that we are checking a track
-                             # print(f"Checking Track {t.track_id}...", end=" ")
-
-                             # Loop through specific people in gallery
-                             for name, g_feats in gallery_dict.items():
-                                 # Handle multi-look (list of features) vs single formatted gallery
-                                 if not isinstance(g_feats, list):
-                                     g_feats = [g_feats] # Backward compatibility
-                                     
-                                 # Find the closest "look" for this person
-                                 person_min_dist = 100.0
-                                 
-                                 for g_feat in g_feats:
-                                     current_dist = 1.0 - np.dot(feat, g_feat)
-                                     
-                                     # Ensure scalar
-                                     if isinstance(current_dist, np.ndarray):
-                                         current_dist = current_dist.item()
-                                         
-                                     if current_dist < person_min_dist:
-                                         person_min_dist = current_dist
-                                 
-                                 # Check if this person is the overall best match
-                                 if person_min_dist < min_dist:
-                                     min_dist = person_min_dist
-                                     best_name = name
-                                     
-                                 # DEBUG: Print distance (closest look)
-                                 # print(f"  vs {name}: {person_min_dist:.4f}")
-
+                             min_idx = np.argmin(dists)
+                             min_dist = dists[min_idx]
+                             
                              # Threshold check (kept at 0.1)
-                             if best_name and min_dist < 0.1:
+                             if min_dist < 0.1:
+                                 best_name = gallery_labels[min_idx]
                                  id_map[t.track_id] = best_name
-                                 print(f"[MATCH] Track ID {t.track_id} identified as {best_name} (Dist: {min_dist:.4f})")
+                                 id_cache[t.track_id] = best_name # Update Persistent Cache
+                                 dist_map[t.track_id] = min_dist # Store for logging
+                                 
+                                 if tuple(dists).index(min_dist) == 0: 
+                                      pass 
                              else:
-                                 # Optional: Print why it failed
-                                 if best_name:
-                                     print(f"[NO MATCH] Track ID {t.track_id} closest to {best_name} but dist {min_dist:.4f} > 0.1")
+                                 # If re-verification failed, remove from cache (person left or occlusion)
+                                 if t.track_id in id_cache:
+                                     del id_cache[t.track_id]
+
+
+                
+                # OPTIMIZATION / FEATURE: Logging
+                if save_log:
+                    # Calculate timestamp
+                    # current_time_sec = frame_idx * vid_stride / 30.0 # Approximation if FPS unknown
+                    # Better to use dataset properties if available, but for now generic:
+                    timestamp = frame_idx * vid_stride / 30.0 
+                    
+                    for t in strongsort_list[i].tracker.tracks:
+                        if t.is_confirmed() and t.time_since_update <= 1:
+                             name = id_map.get(t.track_id, "Unknown")
+                             
+                             # Retrieve real values
+                             conf_val = getattr(t, 'conf', -1)
+                             if isinstance(conf_val, torch.Tensor):
+                                 conf_val = conf_val.item()
+                             
+                             dist_val = dist_map.get(t.track_id, -1)
+                             if dist_val != -1 and isinstance(dist_val, (np.float32, np.float64)):
+                                 dist_val = f"{dist_val:.4f}"
+
+                             with open(log_path, 'a') as f:
+                                 # Frame, Timestamp, TrackID, Name, Confidence, Dist
+                                 f.write(f"{frame_idx},{timestamp:.2f},{t.track_id},{name},{conf_val:.2f},{dist_val}\n")
+                             log_count += 1
+
 
                 # Write results
                 for j, (output, conf) in enumerate(zip(outputs[i], confs)):
@@ -420,6 +481,84 @@ def run(
     if save_txt or save_img:
         s = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if save_txt else ''
         LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}{s}")
+    
+    if save_log:
+        LOGGER.info(f"Attendance Log saved to {log_path} ({log_count} entries)")
+        
+        # IMPROVISATION: Generate Summary Report
+        try:
+             import pandas as pd
+             if log_count > 0:
+                 summary_path = save_dir / 'attendance_summary.csv'
+                 df = pd.read_csv(log_path)
+                 
+                 # Group by Name to handle re-entries across different TrackIDs if identified
+                 # Or Group by TrackID first? User wants "1 testperson enter left enter left"
+                 # Strategy: Filter valid Names (not Unknown if possible, or include Unknowns by TrackID)
+                 
+                 session_rows = []
+                 
+                 # FEATURE: Filter out 'Unknown' from summary as requested
+                 df_filtered = df[~df['Name'].str.contains('Unknown', case=False, na=False)]
+                 
+                 if df_filtered.empty:
+                      LOGGER.info("No identified people found for summary.")
+                 else:
+                     # Process each unique Name
+                     for name, group in df_filtered.groupby('Name'):
+                         group = group.sort_values('Timestamp')
+                         timestamps = group['Timestamp'].values
+                         
+                         if len(timestamps) == 0:
+                             continue
+                             
+                         # Detect separate sessions (Gap > 3 seconds)
+                         # Reduced to 3s to be more sensitive to leaving/re-entering
+                         SESSION_GAP_THRESHOLD = 3.0 
+                         
+                         # Identify indices where the gap is large
+                         diffs = np.diff(timestamps)
+                         split_indices = np.where(diffs > SESSION_GAP_THRESHOLD)[0] + 1
+                         
+                         # Split timestamps into sessions
+                         sessions = np.split(timestamps, split_indices)
+                         
+                         session_count = 0
+                         for session_times in sessions:
+                             if len(session_times) == 0:
+                                 continue
+                             start_t = session_times[0]
+                             end_t = session_times[-1]
+                             duration = end_t - start_t
+                             
+                             # NOISE FILTER: Ignore sessions < 1.0 second
+                             if duration < 1.0:
+                                 continue
+                             
+                             session_count += 1
+                             session_rows.append({
+                                 'Name': name,
+                                 'Session_ID': session_count,
+                                 'First_Seen': f"{start_t:.2f}",
+                                 'Last_Seen': f"{end_t:.2f}",
+                                 'Duration_Sec': f"{duration:.2f}",
+                                 'Frame_Count': len(session_times)
+                             })
+                     
+                     if session_rows:
+                         summary_df = pd.DataFrame(session_rows)
+                         summary_df = summary_df.sort_values(['Name', 'First_Seen'])
+                         summary_df.to_csv(summary_path, index=False)
+                         LOGGER.info(f"Attendance SUMMARY (Sessions) saved to {summary_path}")
+                     else:
+                        LOGGER.info("No valid sessions (>1s) found for summary.")
+
+
+        except ImportError:
+             LOGGER.info("Pandas not installed, skipping summary report.")
+        except Exception as e:
+             LOGGER.info(f"Could not generate summary: {e}")
+
     if update:
         strip_optimizer(yolo_weights[0])  # update model (to fix SourceChangeWarning)
 
@@ -456,6 +595,7 @@ def parse_opt():
     parser.add_argument('--vid-stride', type=int, default=1, help='video frame-rate stride')
     parser.add_argument('--dnn', action='store_true', help='use OpenCV DNN for ONNX inference')
     parser.add_argument('--gallery', type=str, default='gallery.pkl', help='path to gallery.pkl for person identification')
+    parser.add_argument('--save-log', action='store_true', help='save attendance log to csv')
     opt = parser.parse_args()
     opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
 
