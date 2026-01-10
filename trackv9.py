@@ -37,6 +37,7 @@ from yolov9.utils.torch_utils import select_device, time_sync, smart_inference_m
 from yolov9.utils.plots import Annotator, colors, save_one_box
 from strong_sort.utils.parser import get_config
 from strong_sort.strong_sort import StrongSORT
+from insightface.app import FaceAnalysis # Face Recognition
 
 
 VID_FORMATS = 'asf', 'avi', 'gif', 'm4v', 'mkv', 'mov', 'mp4', 'mpeg', 'mpg', 'ts', 'wmv'  # include video suffixes
@@ -90,6 +91,7 @@ def run(
         vid_stride=1,  # video frame-rate stride
         gallery='gallery.pkl',  # path to gallery
         save_log=False, # Save ID logs
+        face_gallery='face_gallery.pkl', # path to face gallery
 ):
     source = str(source)
     save_img = not nosave and not source.endswith('.txt')  # save inference images
@@ -208,6 +210,46 @@ def run(
     # Format: {track_id: {'name': name, 'last_check': frame_idx}}
     id_cache = {}
     
+    # ----------------------------------------------------
+    # FACE RECOGNITION INITIALIZATION
+    # ----------------------------------------------------
+    face_app = None
+    face_gallery_dict = {}
+    
+    # NEW: Track-Level Identity Logic
+    # 1. track_face_votes: Accumulates scores { track_id: { name: cum_score } }
+    # 2. locked_identities: Final decision { track_id: name }. Once in here, it's immutable (mostly).
+    from collections import defaultdict
+    track_face_votes = defaultdict(lambda: defaultdict(float))
+    locked_identities = {}
+    
+    # Check if face gallery exists
+    face_gallery_path = face_gallery
+    if not os.path.exists(face_gallery_path):
+        face_gallery_path = ROOT / face_gallery
+        
+    if os.path.exists(face_gallery_path):
+         print(f"Loading Face Gallery from {face_gallery_path}...")
+         try:
+             with open(face_gallery_path, "rb") as f:
+                 face_gallery_dict = pickle.load(f)
+             
+             if face_gallery_dict:
+                 print(f"Face Gallery Loaded: {len(face_gallery_dict)} identities.")
+                 print("Initializing InsightFace App (this may take a few seconds)...")
+                 # Use CPU or CUDA depending on availability. For robustness, using CPU or auto.
+                 providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+                 face_app = FaceAnalysis(name='buffalo_l', providers=providers)
+                 face_app.prepare(ctx_id=0, det_size=(640, 640))
+                 print("InsightFace App Initialized.")
+             else:
+                 print("Face Gallery is empty.")
+         except Exception as e:
+             print(f"Error loading face gallery: {e}")
+    else:
+        print(f"Face Gallery not found at {face_gallery_path}. Face recognition disabled.")
+
+    
     # Store distances for logging (TrackID -> Dist)
     dist_map = {}
 
@@ -312,8 +354,96 @@ def run(
                          if not t.is_confirmed() or t.time_since_update > 1:
                              continue
                          
-                         # OPTIMIZATION: Persistent Caching Logic
-                         # Check if we already know this track ID from previous frames
+                         # ----------------------------------------------------
+                         # FACE RECOGNITION LOGIC (TRACK LEVEL FUSION)
+                         # ----------------------------------------------------
+                         
+                         # Check if this track is already LOCKED
+                         if t.track_id in locked_identities:
+                             # FORCE the locked identity
+                             locked_name = locked_identities[t.track_id]
+                             id_map[t.track_id] = locked_name
+                             id_cache[t.track_id] = locked_name # Update ReID cache too to keep it consistent
+                             # Skip all other logic for this track (ReID, Face Check)
+                             continue 
+                             
+                         # If not locked, we need to check Face (if possible)
+                         should_check_face = False
+                         
+                         if face_app and t.is_confirmed() and t.time_since_update <= 1:
+                             # Always check if not locked (every frame or skip for perf?)
+                             # To fix "flicker", we should check every frame UNTIL locked.
+                             # Once locked, we stop checking.
+                             if frame_idx % 2 == 0: # Check often (every 2nd frame) to get lock fast
+                                 should_check_face = True
+                                 
+                         if should_check_face:
+                             # Extract Crop
+                             bbox = t.to_tlbr() # x1, y1, x2, y2
+                             x1, y1, x2, y2 = map(int, bbox)
+                             
+                             # Ensure within image bounds
+                             h, w, _ = im0.shape
+                             x1 = max(0, x1)
+                             y1 = max(0, y1)
+                             x2 = min(w, x2)
+                             y2 = min(h, y2)
+                             
+                             # NOISE FILTER: Ignore small crops (too far away)
+                             if (x2 - x1) < 40 or (y2 - y1) < 40:
+                                 pass # Too small
+                             elif x2 > x1 and y2 > y1:
+                                 face_crop = im0[y1:y2, x1:x2]
+                                 
+                                 # Detect Faces
+                                 try:
+                                     faces = face_app.get(face_crop)
+                                     if faces:
+                                         # Assume largest face is the person
+                                         faces = sorted(faces, key=lambda x: (x.bbox[2]-x.bbox[0])*(x.bbox[3]-x.bbox[1]), reverse=True)
+                                         best_face = faces[0]
+                                         
+                                         # QUALITY CHECK: Det Score
+                                         if best_face.det_score > 0.55: # Only high quality detections
+                                             face_emb = best_face.embedding
+                                             
+                                             # Match against Gallery
+                                             best_face_name = "Unknown"
+                                             best_face_score = 0.0
+                                             
+                                             for g_name, g_embs in face_gallery_dict.items():
+                                                 for g_emb in g_embs:
+                                                      sim = np.dot(face_emb, g_emb) / (np.linalg.norm(face_emb) * np.linalg.norm(g_emb) + 1e-6)
+                                                      if sim > best_face_score:
+                                                          best_face_score = sim
+                                                          best_face_name = g_name
+                                             
+                                             # VOTING LOGIC
+                                             # Strong Match -> Huge Vote (Immediate Lock likely)
+                                             # Weak Match -> Small Vote (Accumulate)
+                                             
+                                             LOCK_THRESHOLD = 1.0 # Need 1.0 accumulated score to lock
+                                             
+                                             if best_face_score > 0.6: # High confidence
+                                                 track_face_votes[t.track_id][best_face_name] += 1.5 # Immediate Lock
+                                             elif best_face_score > 0.35: # Medium confidence
+                                                  track_face_votes[t.track_id][best_face_name] += 0.4 # Need ~3 frames
+                                                  
+                                             # Check if any candidate has crossed the lock threshold
+                                             for cand_name, score in track_face_votes[t.track_id].items():
+                                                 if score >= LOCK_THRESHOLD:
+                                                     # LOCK IT!
+                                                     locked_identities[t.track_id] = cand_name
+                                                     id_map[t.track_id] = cand_name
+                                                     id_cache[t.track_id] = cand_name
+                                                     print(f"🔒 TRACK {t.track_id} LOCKED TO {cand_name} (Score: {score:.2f})")
+                                                     break
+                                                     
+                                 except Exception as e:
+                                     pass 
+
+                         # OPTIMIZATION: Persistent Caching Logic (Legacy ReID)
+                         # Only runs if NOT Locked
                          cached_name = id_cache.get(t.track_id)
                          
                          should_run_matching = True
@@ -595,6 +725,7 @@ def parse_opt():
     parser.add_argument('--vid-stride', type=int, default=1, help='video frame-rate stride')
     parser.add_argument('--dnn', action='store_true', help='use OpenCV DNN for ONNX inference')
     parser.add_argument('--gallery', type=str, default='gallery.pkl', help='path to gallery.pkl for person identification')
+    parser.add_argument('--face-gallery', type=str, default='face_gallery.pkl', help='path to face_gallery.pkl for face recognition')
     parser.add_argument('--save-log', action='store_true', help='save attendance log to csv')
     opt = parser.parse_args()
     opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
