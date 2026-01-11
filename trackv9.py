@@ -38,6 +38,7 @@ from yolov9.utils.plots import Annotator, colors, save_one_box
 from strong_sort.utils.parser import get_config
 from strong_sort.strong_sort import StrongSORT
 from insightface.app import FaceAnalysis # Face Recognition
+from runtime_gallery import RuntimeGallery # Advanced Session Memory
 
 
 VID_FORMATS = 'asf', 'avi', 'gif', 'm4v', 'mkv', 'mov', 'mp4', 'mpeg', 'mpg', 'ts', 'wmv'  # include video suffixes
@@ -223,6 +224,15 @@ def run(
     track_face_votes = defaultdict(lambda: defaultdict(float))
     locked_identities = {}
     
+    # ----------------------------------------------------
+    # RUNTIME SESSION MEMORY
+    # ----------------------------------------------------
+    # Advanced Class-based Gallery
+    session_memory = RuntimeGallery(max_samples=10, expiration_seconds=120)
+    
+    # ----------------------------------------------------
+    
+    
     # Check if face gallery exists
     face_gallery_path = face_gallery
     if not os.path.exists(face_gallery_path):
@@ -252,6 +262,18 @@ def run(
     
     # Store distances for logging (TrackID -> Dist)
     dist_map = {}
+    
+    # PERFORMANCE CACHE (TrackID -> FrameIdx)
+    # If a track was checked/locked recently, skip expensive re-verify
+    perf_track_cache = {}
+    
+    # STATE MACHINE (TrackID -> State)
+    # States: 'UNKNOWN' (Default), 'LOCKED'
+    track_states = defaultdict(lambda: 'UNKNOWN')
+    
+    # BUFFERED LOGGING
+    log_buffer = []
+    MAX_LOG_BUFFER = 100
 
 
 
@@ -354,134 +376,149 @@ def run(
                          if not t.is_confirmed() or t.time_since_update > 1:
                              continue
                          
+                         # Check lock status early
+                         is_locked = t.track_id in locked_identities
+                         
+                         
                          # ----------------------------------------------------
-                         # FACE RECOGNITION LOGIC (TRACK LEVEL FUSION)
+                         # IDENTITY STATE MACHINE FLOW
                          # ----------------------------------------------------
                          
-                         # Check if this track is already LOCKED
-                         if t.track_id in locked_identities:
-                             # FORCE the locked identity
-                             locked_name = locked_identities[t.track_id]
-                             id_map[t.track_id] = locked_name
-                             id_cache[t.track_id] = locked_name # Update ReID cache too to keep it consistent
-                             # Skip all other logic for this track (ReID, Face Check)
-                             continue 
-                             
-                         # If not locked, we need to check Face (if possible)
-                         should_check_face = False
+                         curr_state = track_states[t.track_id]
                          
-                         if face_app and t.is_confirmed() and t.time_since_update <= 1:
-                             # Always check if not locked (every frame or skip for perf?)
-                             # To fix "flicker", we should check every frame UNTIL locked.
-                             # Once locked, we stop checking.
-                             if frame_idx % 2 == 0: # Check often (every 2nd frame) to get lock fast
-                                 should_check_face = True
+                         # Check if we should downgrade state (Lost Lock Logic?)
+                         # e.g. if ReID confidence drops? (Not implemented for stability)
+                         
+                         # === STATE 1: LOCKED (STABLE) ===
+                         if curr_state == 'LOCKED':
+                             # Sanity Check: Every 60 frames (2s)
+                             # Or if we have explicit reason to doubt
+                             if frame_idx % 60 == 0:
+                                 # Allow one pass of verification
+                                 pass 
+                             else:
+                                 # 98% of frames: SKIP ALL CHECKS
+                                 # Just Maintain ID
+                                 if t.track_id in id_map:
+                                     # Already mapped?
+                                     pass
+                                 elif t.track_id in locked_identities:
+                                     id_map[t.track_id] = locked_identities[t.track_id]
                                  
-                         if should_check_face:
-                             # Extract Crop
+                                 continue # Skip Fusion Logic
+                                 
+                         # === STATE 2: UNKNOWN / RECOVERY ===
+                         
+                         # 1. Component 1: Body Feature
+                         body_feat = None
+                         if len(t.features) > 0:
+                             body_feat = t.features[-1]
+                             body_feat = body_feat / np.linalg.norm(body_feat)
+                             body_feat = body_feat.reshape(-1)
+                             
+                         # 2. Component 2: Face Feature (if visible)
+                         face_feat = None
+                         
+                         # Only run Face if UNKNOWN (Discovery) or Sanity Check
+                         # (Logic falls through here if not Locked or if Sanity frame)
+                         should_run_face = True # Default for Unknown
+                         
+                         if face_app and t.is_confirmed() and t.time_since_update <= 1 and should_run_face:
+                              # Extract Crop
                              bbox = t.to_tlbr() # x1, y1, x2, y2
                              x1, y1, x2, y2 = map(int, bbox)
-                             
-                             # Ensure within image bounds
                              h, w, _ = im0.shape
-                             x1 = max(0, x1)
-                             y1 = max(0, y1)
-                             x2 = min(w, x2)
-                             y2 = min(h, y2)
+                             x1 = max(0, x1); y1 = max(0, y1); x2 = min(w, x2); y2 = min(h, y2)
                              
-                             # NOISE FILTER: Ignore small crops (too far away)
-                             if (x2 - x1) < 40 or (y2 - y1) < 40:
-                                 pass # Too small
-                             elif x2 > x1 and y2 > y1:
+                             if (x2 - x1) > 40 and (y2 - y1) > 40: # Size check
                                  face_crop = im0[y1:y2, x1:x2]
-                                 
-                                 # Detect Faces
                                  try:
                                      faces = face_app.get(face_crop)
                                      if faces:
-                                         # Assume largest face is the person
                                          faces = sorted(faces, key=lambda x: (x.bbox[2]-x.bbox[0])*(x.bbox[3]-x.bbox[1]), reverse=True)
                                          best_face = faces[0]
-                                         
-                                         # QUALITY CHECK: Det Score
-                                         if best_face.det_score > 0.55: # Only high quality detections
-                                             face_emb = best_face.embedding
-                                             
-                                             # Match against Gallery
-                                             best_face_name = "Unknown"
-                                             best_face_score = 0.0
-                                             
-                                             for g_name, g_embs in face_gallery_dict.items():
-                                                 for g_emb in g_embs:
-                                                      sim = np.dot(face_emb, g_emb) / (np.linalg.norm(face_emb) * np.linalg.norm(g_emb) + 1e-6)
-                                                      if sim > best_face_score:
-                                                          best_face_score = sim
-                                                          best_face_name = g_name
-                                             
-                                             # VOTING LOGIC
-                                             # Strong Match -> Huge Vote (Immediate Lock likely)
-                                             # Weak Match -> Small Vote (Accumulate)
-                                             
-                                             LOCK_THRESHOLD = 1.0 # Need 1.0 accumulated score to lock
-                                             
-                                             if best_face_score > 0.6: # High confidence
-                                                 track_face_votes[t.track_id][best_face_name] += 1.5 # Immediate Lock
-                                             elif best_face_score > 0.35: # Medium confidence
-                                                  track_face_votes[t.track_id][best_face_name] += 0.4 # Need ~3 frames
-                                                  
-                                             # Check if any candidate has crossed the lock threshold
-                                             for cand_name, score in track_face_votes[t.track_id].items():
-                                                 if score >= LOCK_THRESHOLD:
-                                                     # LOCK IT!
-                                                     locked_identities[t.track_id] = cand_name
-                                                     id_map[t.track_id] = cand_name
-                                                     id_cache[t.track_id] = cand_name
-                                                     print(f"🔒 TRACK {t.track_id} LOCKED TO {cand_name} (Score: {score:.2f})")
-                                                     break
-                                                     
-                                 except Exception as e:
-                                     pass 
+                                         if best_face.det_score > 0.60: # High quality only
+                                            face_feat = best_face.embedding
+                                            face_feat = face_feat / np.linalg.norm(face_feat) # Normalize
+                                 except: pass
 
-                         # OPTIMIZATION: Persistent Caching Logic (Legacy ReID)
-                         # Only runs if NOT Locked
-                         cached_name = id_cache.get(t.track_id)
+                         # 3. COMPUTE SCORES
                          
-                         should_run_matching = True
-                         if cached_name:
-                             # We know this person. 
-                             # Optimization: Only re-verify every 30 frames to save compute.
-                             if frame_idx % 30 != 0:
-                                 should_run_matching = False
-                                 # Trust the cache for this frame
-                                 id_map[t.track_id] = cached_name
+                         # A. Runtime Gallery Scores (RECOVERY MECHANISM)
+                         # We check this FIRST for Unknown tracks to assume identity from session
+                         r_name, r_score_raw, r_type = session_memory.get_best_match(body_feat, face_feat)
                          
-                         if should_run_matching and len(t.features) > 0:
-                             feat = t.features[-1]
-                             feat = feat / np.linalg.norm(feat) # Ensure normalized
-                             feat = feat.reshape(-1) # Ensure (512,)
+                         # Optimization: If Session Match is very strong, accept immediately?
+                         # Let's stick to fusion but weight it high.
+                         
+                         # B. Global Gallery Scores (Body)
+                         g_body_name = "Unknown"
+                         g_body_score = 0.0
+                         if body_feat is not None and len(gallery_matrix) > 0:
+                             scores = np.dot(gallery_matrix, body_feat)
+                             # max score
+                             g_idx = np.argmax(scores)
+                             g_body_score = scores[g_idx]
+                             g_body_name = gallery_labels[g_idx]
                              
-                             # OPTIMIZATION: Vectorized Cosine Distance
-                             # Dist = 1 - (Gallery . Track)
-                             # Shape: (N,) = (N, 512) . (512,)
-                             scores = np.dot(gallery_matrix, feat)
-                             dists = 1.0 - scores
-                             
-                             min_idx = np.argmin(dists)
-                             min_dist = dists[min_idx]
-                             
-                             # Threshold check (kept at 0.1)
-                             if min_dist < 0.1:
-                                 best_name = gallery_labels[min_idx]
-                                 id_map[t.track_id] = best_name
-                                 id_cache[t.track_id] = best_name # Update Persistent Cache
-                                 dist_map[t.track_id] = min_dist # Store for logging
+                         # C. Global Gallery Scores (Face)
+                         g_face_name = "Unknown"
+                         g_face_score = 0.0
+                         if face_feat is not None and face_gallery_dict:
+                             for name, feats in face_gallery_dict.items():
+                                 if not feats: continue
+                                 # Max sim against all templates
+                                 sims = [np.dot(face_feat, f) for f in feats]
+                                 max_sim = max(sims)
+                                 if max_sim > g_face_score:
+                                     g_face_score = max_sim
+                                     g_face_name = name
+
+                         # 4. FUSION WEIGHTING
+                         score_runtime = r_score_raw # Alrady weighted
+                         score_global_face = g_face_score * 0.9
+                         score_global_body = g_body_score * 0.7
+                         
+                         candidates = [
+                             (r_name, score_runtime, "runtime"),
+                             (g_face_name, score_global_face, "global_face"),
+                             (g_body_name, score_global_body, "global_body")
+                         ]
+                         candidates.sort(key=lambda x: x[1], reverse=True)
+                         winner_name, winner_score, winner_source = candidates[0]
+                         
+                         # 5. DECISION & STATE UPDATE
+                         
+                         final_name = "Unknown"
+                         
+                         # If we were already locked (Sanity Check Frame), default to keeping it
+                         # unless strong evidence says otherwise?
+                         if curr_state == 'LOCKED':
+                             # Sanity check logic: if winner is diff and score is high -> CONFLICT?
+                             # For now, let's just re-affirm or keep quiet.
+                             final_name = locked_identities[t.track_id]
+                         else:
+                             # UNKNOWN STATE -> Try to LOCK
+                             if winner_score > 0.75: # Confirmed
+                                 final_name = winner_name
+                                 # Update confidence
+                                 session_memory.update(final_name, body_feat, face_feat, similarity=winner_score)
                                  
-                                 if tuple(dists).index(min_dist) == 0: 
-                                      pass 
-                             else:
-                                 # If re-verification failed, remove from cache (person left or occlusion)
-                                 if t.track_id in id_cache:
-                                     del id_cache[t.track_id]
+                                 # Check Lock threshold logic
+                                 conf = session_memory.get_confidence(final_name)
+                                 if conf >= 1.0:
+                                     locked_identities[t.track_id] = final_name
+                                     track_states[t.track_id] = 'LOCKED' # TRANSITION TO LOCKED
+                                     print(f"🔒 TRACK {t.track_id} LOCKED TO {final_name} (Conf: {conf:.1f}) via {winner_source}")
+                                     
+                             elif winner_score > 0.55: # Candidate
+                                 final_name = winner_name
+                                 
+                         # Update ID Map
+                         id_map[t.track_id] = final_name
+                         id_cache[t.track_id] = final_name
+                         dist_map[t.track_id] = winner_score # Log the score
+
 
 
                 
